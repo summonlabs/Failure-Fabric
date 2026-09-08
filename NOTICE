@@ -1,6 +1,6 @@
 Failure Fabric
 
-Copyright © Summon Software Labs
+Copyright 2026 Summon Software Labs
 
 Failure Fabric is an open-source, vendor-neutral runtime for explicit failure semantics, retry classification, ambiguous completion, idempotency, rollback, fencing, recovery ownership, and deterministic fault handling across distributed AI infrastructure.
 
