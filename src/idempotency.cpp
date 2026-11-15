@@ -24,8 +24,18 @@ IdempotencyVerdict IdempotencyStore::begin(const OperationId& op, const Idempote
   Entry& e = it->second;
   if (e.payload_hash != hash) return IdempotencyVerdict::CONFLICT; // conflicting duplicate payload
   if (e.state == IdempotencyState::CONFLICT) return IdempotencyVerdict::CONFLICT;
+  // A submission from an older epoch or attempt generation than the one the key
+  // was last used under is stale, even under a valid key.
+  if (auth.coordinator_epoch < e.authority.coordinator_epoch ||
+      auth.attempt_generation < e.authority.attempt_generation) return IdempotencyVerdict::STALE;
   if (e.state == IdempotencyState::COMPLETED) return IdempotencyVerdict::COMPLETED_REPLAY;
-  if (e.state == IdempotencyState::FAILED) return IdempotencyVerdict::NEW; // failed -> may retry fresh
+  e.authority = auth;
+  if (e.state == IdempotencyState::FAILED) {
+    // failed -> may retry fresh; that retry is now the one in flight, so a
+    // further duplicate is deduplicated instead of executing again.
+    e.state = IdempotencyState::IN_PROGRESS;
+    return IdempotencyVerdict::NEW;
+  }
   return IdempotencyVerdict::IN_PROGRESS_REPLAY;
 }
 

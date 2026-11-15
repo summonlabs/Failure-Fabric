@@ -37,9 +37,19 @@ static RecoveryOwner g_owner = RecoveryOwner::COORDINATOR;
 
 static void save_state() { g_store.save(g_statefile); }
 
-static void new_attempt(AuthorityEnvelope& fresh) {
+// The first worker in registration order that is still connected (g_mu held).
+static std::shared_ptr<Conn> first_registered_locked() {
+  for (const auto& c : g_reg_order) {
+    auto it = g_workers.find(c->wid);
+    if (it != g_workers.end() && it->second == c) return c;
+  }
+  return nullptr;
+}
+
+static void new_attempt(AuthorityEnvelope& fresh, const WorkerBootId& boot) {
   // fresh attempt for re-dispatch: new attempt id + generation + boot
   fresh.attempt = AttemptId::generate();
+  fresh.worker_boot = boot;
   fresh.attempt_generation = fresh.attempt_generation.next();
   fresh.operation_generation = fresh.operation_generation.next();
   fresh.failure_generation = fresh.failure_generation.next();
@@ -85,12 +95,12 @@ static void handle_message(const std::shared_ptr<Conn>& conn, const WireMessage&
       auth.attempt = AttemptId::generate();
       auth.attempt_generation = AttemptGeneration(1);
       auth.operation_generation = OperationGeneration(1);
-      auth.worker_boot = g_workers.empty() ? WorkerBootId{} : g_workers.begin()->second->boot;
       std::shared_ptr<Conn> target;
       {
         std::lock_guard<std::mutex> lk(g_mu);
-        if (g_workers.empty()) { std::printf("[coord] no workers\n"); return; }
-        target = g_workers.begin()->second;
+        target = first_registered_locked();
+        if (!target) { std::printf("[coord] no workers\n"); return; }
+        auth.worker_boot = target->boot;
         g_store.ops().create(op, auth);
         g_store.ops().dispatch(op, auth);
       }
@@ -145,24 +155,35 @@ static void worker_thread(std::shared_ptr<Conn> conn) {
   // recover: fence its boot, transfer ownership, re-dispatch under a fresh
   // attempt to another worker.
   bool was_running = false;
+  bool finished = false;
   {
     std::lock_guard<std::mutex> lk(g_mu);
     was_running = (conn == g_running_conn);
-    if (was_running) {
-      g_workers.erase(conn->wid);
-      g_running_conn.reset();
+    finished = g_finished;
+    if (was_running) g_running_conn.reset();
+    // A disconnected worker is no longer a dispatch or recovery target, whether
+    // or not it was running the operation.
+    auto it = g_workers.find(conn->wid);
+    if (it != g_workers.end() && it->second == conn) g_workers.erase(it);
+    for (auto r = g_reg_order.begin(); r != g_reg_order.end(); ++r) {
+      if (*r == conn) { g_reg_order.erase(r); break; }
     }
   }
-  if (was_running && !g_finished) {
+  if (was_running && !finished) {
     std::printf("[coord] worker %s lost while running %s -> AMBIGUOUS + recovery\n",
                 conn->wid.to_display().c_str(), g_current_op.to_display().c_str());
     // Classify ambiguous (side effects unknown), fence stale boot.
     AuthorityEnvelope cur;
+    std::shared_ptr<Conn> replacement;
     {
       std::lock_guard<std::mutex> lk(g_mu);
       cur = g_store.ops().current_authority(g_current_op);
-      // fence the lost boot; transfer ownership to a fresh replacement generation.
-      g_store.ownership().transfer(RecoveryOwner::REPLACEMENT_WORKER, RecoveryGeneration(cur.recovery_generation.next()), WorkerBootId::generate(), cur);
+      // Re-dispatch goes to the next registered worker that is still connected.
+      replacement = first_registered_locked();
+      // fence the lost boot; transfer ownership to the replacement's boot under
+      // a fresh recovery generation.
+      g_store.ownership().transfer(RecoveryOwner::REPLACEMENT_WORKER, RecoveryGeneration(cur.recovery_generation.next()),
+                                   replacement ? replacement->boot : WorkerBootId::generate(), cur);
     }
     // record an ambiguous failure record, immutable
     FailureRecordBuilder b;
@@ -176,14 +197,11 @@ static void worker_thread(std::shared_ptr<Conn> conn) {
       g_store.append_failure(b.build());
       g_store.ops().report_failure(g_current_op, cur, true);
     }
-    // Re-dispatch with a fresh attempt to the next registered worker.
-    std::shared_ptr<Conn> replacement;
+    // Re-dispatch with a fresh attempt, bound to the replacement worker's boot.
     AuthorityEnvelope fresh = cur;
-    new_attempt(fresh);
+    new_attempt(fresh, replacement ? replacement->boot : cur.worker_boot);
     {
       std::lock_guard<std::mutex> lk(g_mu);
-      replacement = g_workers.empty() ? nullptr : (g_reg_order.empty() ? nullptr : g_reg_order[0]);
-        if (replacement && !g_workers.count(replacement->wid)) replacement = g_workers.empty() ? nullptr : g_workers.begin()->second;
       if (replacement) g_store.ops().dispatch(g_current_op, fresh);
     }
     if (replacement && !OperationStateMachine::is_terminal(g_store.ops().state(g_current_op))) {

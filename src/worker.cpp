@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
       // Real side effect: write an attempt marker file scoped by attempt gen.
       // This is the side effect that is "unknown" if the worker dies before ack.
       char path[512];
-      std::snprintf(path, sizeof(path), "%s\attempt_%s_marker.txt", workdir.c_str(), m.authority.attempt_generation.is_unset() ? "0" : std::to_string(m.authority.attempt_generation.value).c_str());
+      std::snprintf(path, sizeof(path), "%s\\attempt_%s_marker.txt", workdir.c_str(), m.authority.attempt_generation.is_unset() ? "0" : std::to_string(m.authority.attempt_generation.value).c_str());
       FILE* f = std::fopen(path, "a");
       if (f) { std::fprintf(f, "worker_%s_attempt_%s marker\n", mode.c_str(), std::to_string(m.authority.attempt_generation.value).c_str()); std::fclose(f); }
 

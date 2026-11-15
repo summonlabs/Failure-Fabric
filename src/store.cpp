@@ -1,7 +1,9 @@
 #include "failure_fabric/store.hpp"
 #include "failure_fabric/persistence.hpp"
 #include <fstream>
+#include <set>
 #include <unordered_set>
+#include <utility>
 #include <cstring>
 
 namespace ff {
@@ -10,6 +12,13 @@ constexpr uint8_t K_FAIL = 1;
 constexpr uint8_t K_OP   = 2;
 constexpr uint8_t K_ID   = 3;
 constexpr uint8_t K_OWN  = 4;
+
+// Limits of the snapshot codec: str16 carries a 16-bit length, and
+// decode_failure_record rejects longer dependency lists as malformed.
+constexpr size_t kMaxStr16 = 0xFFFF;
+constexpr size_t kMaxFailureDependencies = 4096;
+constexpr uint32_t kRecoveryOwnerCount = 9;      // RecoveryOwner enumerators
+constexpr uint32_t kIdempotencyStateCount = 4;   // IdempotencyState enumerators
 
 void enc_auth(BinaryWriter& w, const AuthorityEnvelope& e) {
   w.generation(e.coordinator_epoch); w.uuid(e.worker_boot.raw); w.uuid(e.attempt.raw);
@@ -31,6 +40,11 @@ bool FailureStore::append_failure(const FailureRecord& rec) {
   if (failures_.count(rec.failure_id)) return false;
   if (rec.operation.is_null() || rec.attempt.is_null()) return false;
   if (!validate_authority(rec.authority)) return false;
+  // Only records the snapshot codec can round-trip are admitted to the immutable
+  // log: a longer string would be saved as empty, and more dependencies than
+  // the decoder accepts would make every later load of the store fail.
+  if (rec.summary.size() > kMaxStr16 || rec.reason.size() > kMaxStr16 ||
+      rec.dependencies.size() > kMaxFailureDependencies) return false;
   failures_.emplace(rec.failure_id, rec);
   return true;
 }
@@ -56,6 +70,15 @@ static void write_frame(std::ofstream& f, uint8_t kind, const std::vector<uint8_
 
 bool FailureStore::save(const std::string& path) const {
   std::lock_guard<std::mutex> lk(mu_);
+  // A string the codec cannot represent would be written as empty. Refuse to
+  // write a snapshot that silently drops a terminal outcome or a prior result.
+  for (const OperationId& op : ops_.operations()) {
+    const OperationRuntime* rt = ops_.find(op);
+    if (rt && rt->terminal_outcome.size() > kMaxStr16) return false;
+  }
+  for (const auto& e : idem_.collect()) {
+    if (e.result_metadata.size() > kMaxStr16) return false;
+  }
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) return false;
   BinaryWriter hw;
@@ -113,6 +136,12 @@ bool FailureStore::load(const std::string& path) {
   std::vector<OperationId> opids;
   std::vector<IdempotencyStore::EntryView> idents;
   uint32_t nfail = 0, nop = 0, nid = 0;
+  // Recovery ownership is decoded here and installed with the rest of the
+  // snapshot at commit, so a rejected file never changes the current owner.
+  bool own_seen = false;
+  RecoveryOwner own_owner = RecoveryOwner::NONE;
+  RecoveryGeneration own_gen{};
+  WorkerBootId own_boot{};
   bool first = true;
   size_t off = 0;
   while (off < data.size()) {
@@ -120,6 +149,7 @@ bool FailureStore::load(const std::string& path) {
     if (!decode_frame(data.data(), data.size(), off, h, next)) return false;
     BinaryReader r(h.payload.data(), h.payload.size());
     if (first) {
+      if (h.kind != 0) return false;
       if (r.u32() != kFFMagic || r.u16() != kFFVersion) return false;
       nfail = r.u32(); nop = r.u32(); nid = r.u32();
       if (!r.ok()) return false;
@@ -132,7 +162,9 @@ bool FailureStore::load(const std::string& path) {
       if (!r.ok()) return false;
       OperationRuntime rt;
       OperationId op(r.uuid());
-      rt.machine.reset(static_cast<OperationState>(r.enumv()));
+      const uint32_t state = r.enumv();
+      if (!r.ok() || state >= static_cast<uint32_t>(OperationStateMachine::count())) return false; // invalid enum
+      rt.machine.reset(static_cast<OperationState>(state));
       rt.attempt_count = r.u32();
       rt.terminal_recorded = r.u8() != 0;
       rt.terminal_outcome = r.str16();
@@ -141,24 +173,34 @@ bool FailureStore::load(const std::string& path) {
       if (!dec_auth(r, rt.authority)) return false;
       if (!dec_auth(r, rt.terminal)) return false;
       if (!r.ok()) return false;
+      // A terminal outcome can only be recorded for an operation in a terminal state.
+      if (rt.terminal_recorded && !OperationStateMachine::is_terminal(rt.machine.state())) return false;
       opids.push_back(op); orts.push_back(std::move(rt));
     } else if (h.kind == K_ID) {
       IdempotencyStore::EntryView ev;
       ev.op = OperationId(r.uuid());
       ev.key = IdempotencyKey{r.uuid()};
       ev.payload_hash = r.u64();
-      ev.state = static_cast<IdempotencyState>(r.enumv());
+      const uint32_t state = r.enumv();
+      if (!r.ok() || state >= kIdempotencyStateCount) return false; // invalid enum
+      ev.state = static_cast<IdempotencyState>(state);
       ev.result_metadata = r.str16();
       if (!r.ok()) return false;
       idents.push_back(std::move(ev));
     } else if (h.kind == K_OWN) {
-      uint32_t owner = r.enumv(); if (!r.ok() || owner >= 9) return false;
+      if (own_seen) return false; // one ownership frame per snapshot
+      uint32_t owner = r.enumv(); if (!r.ok() || owner >= kRecoveryOwnerCount) return false;
       RecoveryGeneration g(r.generation()); WorkerBootId boot(r.uuid());
       if (!r.ok()) return false;
-      ownership_.adopt(static_cast<RecoveryOwner>(owner), g, boot, AuthorityEnvelope{});
+      own_owner = static_cast<RecoveryOwner>(owner); own_gen = g; own_boot = boot;
+      // An assigned owner always holds a nonzero recovery generation.
+      if (own_owner != RecoveryOwner::NONE && own_gen.is_unset()) return false;
+      own_seen = true;
     } else {
       return false;
     }
+    // trailing bytes inside a frame are garbage, not padding
+    if (r.remaining() != 0) return false;
     off = next;
   }
   // strict validation
@@ -170,9 +212,15 @@ bool FailureStore::load(const std::string& path) {
     std::unordered_set<OperationId> seen;
     for (auto& op : opids) if (!seen.insert(op).second) return false;
   }
+  // duplicate idempotency entries
+  {
+    std::set<std::pair<uuid128, uuid128>> seen;
+    for (auto& ev : idents) if (!seen.insert({ev.op.raw, ev.key.raw}).second) return false;
+  }
   // commit (only after all validation succeeds)
   failures_.clear(); ops_.clear(); idem_.clear();
   ownership_ = RecoveryOwnership{};
+  if (own_owner != RecoveryOwner::NONE) ownership_.adopt(own_owner, own_gen, own_boot, AuthorityEnvelope{});
   for (auto& kv : newfails) failures_.emplace(kv.first, std::move(kv.second));
   for (size_t i = 0; i < opids.size(); ++i) ops_.restore(opids[i], std::move(orts[i]));
   for (auto& ev : idents) idem_.restore(ev.op, ev.key, ev.payload_hash, ev.state, ev.result_metadata);

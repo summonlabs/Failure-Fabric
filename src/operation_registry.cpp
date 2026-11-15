@@ -17,6 +17,19 @@ const char* to_string(ApplyResult v) noexcept {
   return "UNKNOWN";
 }
 
+namespace {
+// The terminal state a terminal outcome names ("COMPLETED" is the outcome
+// confirm_completion records for COMPLETION_CONFIRMED).
+bool terminal_state_named(const std::string& outcome, OperationState& out) {
+  if (outcome == "COMPLETED" || outcome == to_string(OperationState::COMPLETION_CONFIRMED)) { out = OperationState::COMPLETION_CONFIRMED; return true; }
+  for (OperationState s : {OperationState::RECOVERED, OperationState::TERMINAL_FAILED,
+                           OperationState::CANCELLED, OperationState::ABANDONED}) {
+    if (outcome == to_string(s)) { out = s; return true; }
+  }
+  return false;
+}
+}
+
 ApplyResult OperationRegistry::create(const OperationId& op, const AuthorityEnvelope& initial) {
   std::lock_guard<std::mutex> lk(mu_);
   if (ops_.count(op)) return ApplyResult::ALREADY_TERMINAL;
@@ -33,11 +46,20 @@ ApplyResult OperationRegistry::dispatch(const OperationId& op, const AuthorityEn
   if (it == ops_.end()) return ApplyResult::UNKNOWN_OPERATION;
   OperationRuntime& r = it->second;
   if (r.terminal_recorded) return ApplyResult::ALREADY_TERMINAL;
-  r.authority = attempt;
   OperationState s = r.machine.state();
   // A fresh attempt may re-dispatch any non-terminal operation (worker restart,
-  // recovery, retry). Terminal operations can never leave their terminal state.
+  // recovery, retry). Terminal operations can never leave their terminal state,
+  // and a rejected dispatch leaves the current authority untouched.
   if (OperationStateMachine::is_terminal(s)) return ApplyResult::ILLEGAL_TRANSITION;
+  // A dispatch under an older epoch or generation than the current attempt is a
+  // stale command: binding it would put the operation back under superseded
+  // authority and let that attempt's late completion through.
+  if (attempt.coordinator_epoch < r.authority.coordinator_epoch ||
+      attempt.attempt_generation < r.authority.attempt_generation ||
+      attempt.operation_generation < r.authority.operation_generation) {
+    return ApplyResult::STALE_REJECTED;
+  }
+  r.authority = attempt;
   if (s != OperationState::DISPATCHED) {
     r.machine.reset(OperationState::DISPATCHED);
   }
@@ -117,11 +139,19 @@ ApplyResult OperationRegistry::record_terminal(const OperationId& op, const Auth
     return ApplyResult::ALREADY_TERMINAL;
   }
   if (!fence_failure(attempt, r.authority).accepted) return ApplyResult::STALE_REJECTED;
-  bool ok = r.machine.transition(OperationState::TERMINAL_FAILED) ||
-            r.machine.transition(OperationState::CANCELLED) ||
-            r.machine.transition(OperationState::RECOVERED) ||
-            r.machine.transition(OperationState::ABANDONED) ||
-            r.machine.transition(OperationState::COMPLETION_CONFIRMED);
+  // The terminal state is the one the outcome names. Only an outcome that names
+  // no terminal state takes the first terminal state reachable from here.
+  bool ok = false;
+  OperationState named = OperationState::TERMINAL_FAILED;
+  if (terminal_state_named(outcome, named)) {
+    ok = r.machine.transition(named);
+  } else {
+    ok = r.machine.transition(OperationState::TERMINAL_FAILED) ||
+         r.machine.transition(OperationState::CANCELLED) ||
+         r.machine.transition(OperationState::RECOVERED) ||
+         r.machine.transition(OperationState::ABANDONED) ||
+         r.machine.transition(OperationState::COMPLETION_CONFIRMED);
+  }
   if (!ok) return ApplyResult::ILLEGAL_TRANSITION;
   r.terminal_recorded = true;
   r.terminal = attempt;
